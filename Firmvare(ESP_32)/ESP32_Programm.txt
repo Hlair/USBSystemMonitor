@@ -1,0 +1,1036 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <lvgl.h>
+
+// =====================================================================
+// КОНСТАНТИ ТА МАКРОСИ
+// =====================================================================
+#define TFT_CS    5
+#define TFT_RST   4
+#define TFT_DC    2
+#define SCREEN_WIDTH  240
+#define SCREEN_HEIGHT 240
+
+// Палітра кольорів (Nord Theme)
+#define HEX_NORD_BG       0x2E3440
+#define HEX_NORD_BG_LIGHT 0x4C566A
+#define HEX_NORD_TEXT     0xD8DEE9
+#define HEX_NORD_CPU      0x88C0D0
+#define HEX_NORD_GPU      0xA3BE8C
+#define HEX_NORD_RAM      0xEBCB8B
+#define HEX_NORD_RED      0xBF616A
+#define HEX_NORD_ORANGE   0xD08770
+#define NORD_BG           0x2965 
+
+// Макрос розбиття числа з плаваючою комою на цілу та дробову частини
+#define SPLIT_F(val) (int)(val), abs((int)(((val) - (int)(val)) * 10))
+
+// =====================================================================
+// СТРУКТУРИ ДАНИХ
+// =====================================================================
+enum CommandType : uint8_t {
+    HANDSHAKE = 0x01,
+    METRICS_BASIC = 0x02,
+    SET_DISPLAY_MODE = 0x03
+};
+
+struct __attribute__((packed)) PacketHeader {
+    uint8_t magic;
+    CommandType command;
+    uint16_t payload_length;
+};
+
+struct __attribute__((packed)) BasicMetricsPayload {
+    uint8_t cpu_total;
+    uint8_t ram_percent;
+    uint8_t total_ram_gb;
+    uint16_t used_ram_mb; 
+    uint32_t net_rx_kbps;
+    uint32_t net_tx_kbps;
+    uint8_t num_cores;
+    uint8_t core_loads[32];
+    uint8_t num_gpus;
+    uint8_t gpu_loads[4];
+    uint8_t gpu_vram_percents[4];
+    uint8_t num_disks;
+    uint32_t disk_read_kbps[4];
+    uint32_t disk_write_kbps[4];
+};
+
+struct AnimState {
+    float old_val = 0.0f;
+    float target_val = 0.0f;
+    float current_val = 0.0f;
+};
+
+// =====================================================================
+// ГЛОБАЛЬНІ ЗМІННІ ТА ОБ'ЄКТИ
+// =====================================================================
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+static lv_disp_draw_buf_t draw_buf;
+static lv_color_t buf1[SCREEN_WIDTH * SCREEN_HEIGHT / 10];
+SemaphoreHandle_t dataMutex;
+
+// Стан системи
+BasicMetricsPayload currentMetrics = {0};
+uint16_t currentDisplayMode = 0;
+bool isConnected = false;
+unsigned long lastDataReceived = 0;
+bool newDataFlag = false; 
+
+// Буферизація UART
+uint8_t rxBuffer[256];
+uint16_t rxIndex = 0;
+enum RxState { WAIT_MAGIC, WAIT_HEADER, WAIT_PAYLOAD };
+RxState rxState = WAIT_MAGIC;
+PacketHeader tempHeader;
+
+// Анімація
+AnimState animCpu, animRam, animNetRx, animNetTx;
+AnimState animGpus[4], animDisksRead[4], animDisksWrite[4];
+AnimState animCores[32];
+unsigned long animStartTime = 0;
+const float ANIM_DURATION = 150.0f;
+
+// Вказівники на екрани LVGL
+lv_obj_t *scr_splash, *scr_metrics, *scr_chart, *scr_net_radar, *scr_cores;
+lv_obj_t *scr_general, *scr_big_num, *scr_speedometer, *scr_summary;
+
+// Віджети LVGL
+lv_obj_t *arc_cpu, *arc_ram, *label_cpu_percent;
+lv_obj_t *arc_gpu[4], *label_disks[4];
+lv_obj_t *chart_metric, *label_chart_title, *label_chart_bottom;
+lv_chart_series_t *ser_metric_1, *ser_metric_2;
+lv_obj_t *chart_radar, *label_rx_speed, *label_tx_speed;
+lv_chart_series_t *ser_rx, *ser_tx;
+lv_obj_t *core_boxes[32], *core_labels[32];
+lv_obj_t *bar_cpu, *bar_ram, *bar_gpu_gen, *bar_net_dl, *bar_net_ul;
+lv_obj_t *label_bar_cpu, *label_bar_ram, *label_bar_gpu, *label_bar_dl, *label_bar_ul;
+lv_obj_t *cont_big_num, *label_big_num_title, *label_big_num_val;
+lv_obj_t *meter_metric, *label_speedo_title, *label_speedo_val;
+lv_meter_scale_t *meter_scale;
+lv_meter_indicator_t *indic_arc_1, *indic_arc_2, *indic_needle_1, *indic_needle_2;
+lv_obj_t *cont_summary, *label_sum_cpu, *label_sum_ram, *label_sum_net;
+lv_obj_t *box_sum_gpu[4], *label_sum_gpu[4], *box_sum_disk[4], *label_sum_disk[4];
+
+// Параметри відображення
+int currentChartMaxY = 100, currentRadarMaxY = 150, current_meter_max = 100;
+uint8_t configured_cores = 0, sum_configured_gpus = 0, sum_configured_disks = 0;
+bool metricUIShown = false;
+int16_t activeDisplayMode = -1;
+
+// =====================================================================
+// ДОПОМІЖНІ ФУНКЦІЇ ДАНИХ
+// =====================================================================
+
+// Універсальне видобування метрик (підтримує анімовані та сирі дані)
+void get_metric_values(uint8_t base_mode, bool animated, float &v1, float &v2, bool &isDual) {
+    v1 = v2 = 0.0f; 
+    isDual = false;
+    
+    switch(base_mode) {
+        case 10: v1 = animated ? animCpu.current_val : currentMetrics.cpu_total; break;
+        case 20: v1 = animated ? animRam.current_val : currentMetrics.ram_percent; break;
+        case 30: 
+            v1 = (animated ? animNetRx.current_val : currentMetrics.net_rx_kbps) * 8.0f / 1024.0f;
+            v2 = (animated ? animNetTx.current_val : currentMetrics.net_tx_kbps) * 8.0f / 1024.0f;
+            isDual = true; 
+            break;
+        default:
+            if (base_mode >= 40 && base_mode <= 49) {
+                uint8_t idx = base_mode - 40;
+                if (idx < currentMetrics.num_gpus) {
+                    v1 = animated ? animGpus[idx].current_val : currentMetrics.gpu_loads[idx];
+                }
+            } else if (base_mode >= 50 && base_mode <= 59) {
+                uint8_t idx = base_mode - 50;
+                if (idx < currentMetrics.num_gpus) {
+                    v1 = currentMetrics.gpu_vram_percents[idx]; // VRAM не анімується
+                }
+            } else if (base_mode >= 60 && base_mode <= 69) {
+                uint8_t idx = base_mode - 60;
+                if (idx < currentMetrics.num_disks) {
+                    v1 = (animated ? animDisksRead[idx].current_val : currentMetrics.disk_read_kbps[idx]) / 1024.0f;
+                    v2 = (animated ? animDisksWrite[idx].current_val : currentMetrics.disk_write_kbps[idx]) / 1024.0f;
+                    isDual = true;
+                }
+            }
+            break;
+    }
+}
+
+// Формування універсальних заголовків для графіків та екранів
+void set_metric_title(lv_obj_t* label, uint8_t base_mode, const char* default_net_title) {
+    if (base_mode == 10) lv_label_set_text(label, "CPU Total");
+    else if (base_mode == 20) lv_label_set_text(label, "RAM Usage");
+    else if (base_mode == 30) lv_label_set_text(label, default_net_title);
+    else if (base_mode >= 40 && base_mode <= 49) lv_label_set_text_fmt(label, "GPU %d Load", base_mode - 40);
+    else if (base_mode >= 50 && base_mode <= 59) lv_label_set_text_fmt(label, "GPU %d VRAM", base_mode - 50);
+    else if (base_mode >= 60 && base_mode <= 69) lv_label_set_text_fmt(label, "Disk %d", base_mode - 60);
+}
+
+// Плавне змішування кольорів для індикації навантаження
+lv_color_t get_core_color(int percent) {
+    lv_color_t c_green = lv_color_hex(HEX_NORD_GPU);
+    lv_color_t c_yellow = lv_color_hex(HEX_NORD_RAM);
+    lv_color_t c_red = lv_color_hex(HEX_NORD_RED);
+
+    if (percent < 50) return lv_color_mix(c_yellow, c_green, (percent * 255) / 50);
+    return lv_color_mix(c_red, c_yellow, ((percent - 50) * 255) / 50);
+}
+
+// Розрахунок контрольної суми пакету
+uint8_t CalculateChecksum(const uint8_t* data, size_t length) {
+    uint8_t checksum = 0;
+    for (size_t i = 0; i < length; ++i) checksum ^= data[i];
+    return checksum;
+}
+
+// =====================================================================
+// ФАБРИКИ UI КОМПОНЕНТІВ
+// =====================================================================
+void my_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+    tft.drawRGBBitmap(area->x1, area->y1, (uint16_t *)&color_p->full, w, h);
+    lv_disp_flush_ready(disp_drv);
+}
+
+lv_obj_t* create_metric_arc(lv_obj_t * parent, int radius, int thickness, uint32_t color_hex) {
+    lv_obj_t * arc = lv_arc_create(parent);
+    lv_obj_set_size(arc, radius * 2, radius * 2);
+    lv_obj_center(arc);
+    lv_arc_set_rotation(arc, 270);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_range(arc, 0, 100);
+    lv_arc_set_value(arc, 0);
+    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_set_style_arc_width(arc, thickness, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(HEX_NORD_BG_LIGHT), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, thickness, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(color_hex), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR);
+    return arc;
+}
+
+void create_legend_item(lv_obj_t * parent, const char * text, uint32_t color_hex) {
+    lv_obj_t * row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    
+    lv_obj_t * rect = lv_obj_create(row);
+    lv_obj_remove_style_all(rect);
+    lv_obj_set_size(rect, 10, 10);
+    lv_obj_set_style_radius(rect, 3, 0);
+    lv_obj_set_style_bg_opa(rect, 255, 0);
+    lv_obj_set_style_bg_color(rect, lv_color_hex(color_hex), 0);
+    lv_obj_align(rect, LV_ALIGN_LEFT_MID, 0, 0);
+    
+    lv_obj_t * label = lv_label_create(row);
+    lv_obj_set_style_text_color(label, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0); 
+    lv_label_set_text(label, text);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 16, 0);
+}
+
+lv_obj_t* create_labeled_bar(lv_obj_t* parent, int x, int y, int w, int h, uint32_t color, int min_v, int max_v, lv_obj_t** out_label) {
+    lv_obj_t * bar = lv_bar_create(parent);
+    lv_obj_set_size(bar, w, h);
+    lv_obj_set_pos(bar, x, y);
+    lv_bar_set_range(bar, min_v, max_v);
+    
+    lv_obj_set_style_bg_color(bar, lv_color_hex(0x1F232B), LV_PART_MAIN); 
+    lv_obj_set_style_radius(bar, 6, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bar, lv_color_hex(HEX_NORD_BG_LIGHT), LV_PART_MAIN);
+    
+    lv_obj_set_style_bg_color(bar, lv_color_hex(color), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(bar, 6, LV_PART_INDICATOR);
+    
+    *out_label = lv_label_create(bar);
+    lv_obj_center(*out_label);
+    lv_obj_set_style_text_color(*out_label, lv_color_hex(0xFFFFFF), 0); 
+    lv_obj_set_style_text_align(*out_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(*out_label, &lv_font_montserrat_14, 0);
+    return bar;
+}
+
+lv_obj_t* create_summary_box(lv_obj_t* parent, int w, int h, uint32_t color, const char* title, lv_obj_t** out_val_label, bool is_big) {
+    lv_obj_t * box = lv_obj_create(parent);
+    lv_obj_set_size(box, w, h);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x1F232B), 0);
+    lv_obj_set_style_radius(box, 8, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(color), 0);
+    lv_obj_set_style_pad_all(box, 4, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t * label_title = lv_label_create(box);
+    lv_obj_set_style_text_color(label_title, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(label_title, &lv_font_montserrat_14, 0);
+    lv_label_set_text(label_title, title);
+    lv_obj_align(label_title, LV_ALIGN_TOP_LEFT, 0, -2);
+
+    *out_val_label = lv_label_create(box);
+    lv_obj_set_style_text_color(*out_val_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(*out_val_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    if (is_big) {
+        lv_obj_set_style_text_font(*out_val_label, &lv_font_montserrat_24, 0);
+        lv_obj_align(*out_val_label, LV_ALIGN_CENTER, 0, 8);
+    } else {
+        lv_obj_set_style_text_font(*out_val_label, &lv_font_montserrat_14, 0);
+        lv_obj_align(*out_val_label, LV_ALIGN_CENTER, 0, 5); 
+    }
+    return box;
+}
+
+// =====================================================================
+// ЗБІРКА ТА НАЛАШТУВАННЯ ЕКРАНІВ
+// =====================================================================
+void build_splash_screen() {
+    scr_splash = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_splash, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_t * label = lv_label_create(scr_splash);
+    lv_obj_set_style_text_color(label, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_label_set_text(label, "Waiting for PC...");
+    lv_obj_center(label);
+}
+
+void build_metric_screen() {
+    scr_metrics = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_metrics, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+
+    arc_cpu = create_metric_arc(scr_metrics, 110, 14, HEX_NORD_CPU);
+    arc_gpu[0] = create_metric_arc(scr_metrics, 90,  14, HEX_NORD_GPU);
+    arc_ram = create_metric_arc(scr_metrics, 70,  14, HEX_NORD_RAM);
+
+    label_cpu_percent = lv_label_create(scr_metrics);
+    lv_obj_set_style_text_color(label_cpu_percent, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_set_style_text_font(label_cpu_percent, &lv_font_montserrat_24, 0); 
+    lv_label_set_text(label_cpu_percent, "0%");
+    lv_obj_align(label_cpu_percent, LV_ALIGN_CENTER, 0, -25);
+
+    lv_obj_t * legend_cont = lv_obj_create(scr_metrics);
+    lv_obj_remove_style_all(legend_cont);
+    lv_obj_set_size(legend_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_layout(legend_cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(legend_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(legend_cont, 4, 0);
+    lv_obj_align(legend_cont, LV_ALIGN_CENTER, -4, 20);
+
+    create_legend_item(legend_cont, "CPU", HEX_NORD_CPU);
+    create_legend_item(legend_cont, "GPU", HEX_NORD_GPU);
+    create_legend_item(legend_cont, "RAM", HEX_NORD_RAM);
+}
+
+void build_chart_screen() {
+    scr_chart = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_chart, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+
+    label_chart_title = lv_label_create(scr_chart);
+    lv_obj_set_style_text_color(label_chart_title, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_align(label_chart_title, LV_ALIGN_TOP_MID, 0, 15);
+
+    chart_metric = lv_chart_create(scr_chart);
+    lv_obj_set_size(chart_metric, 220, 140);
+    lv_obj_align(chart_metric, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_style_bg_color(chart_metric, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_color(chart_metric, lv_color_hex(HEX_NORD_BG_LIGHT), LV_PART_MAIN);
+    lv_obj_set_style_line_color(chart_metric, lv_color_hex(HEX_NORD_BG_LIGHT), LV_PART_MAIN); 
+    lv_obj_set_style_line_width(chart_metric, 3, LV_PART_ITEMS);
+    lv_obj_set_style_size(chart_metric, 0, LV_PART_INDICATOR); 
+    lv_chart_set_type(chart_metric, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(chart_metric, 60);
+
+    ser_metric_1 = lv_chart_add_series(chart_metric, lv_color_hex(HEX_NORD_TEXT), LV_CHART_AXIS_PRIMARY_Y);
+    ser_metric_2 = lv_chart_add_series(chart_metric, lv_color_hex(HEX_NORD_TEXT), LV_CHART_AXIS_PRIMARY_Y);
+
+    label_chart_bottom = lv_label_create(scr_chart);
+    lv_obj_set_style_text_color(label_chart_bottom, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_align(label_chart_bottom, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+void build_net_radar_screen() {
+    scr_net_radar = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_net_radar, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+
+    chart_radar = lv_chart_create(scr_net_radar);
+    lv_obj_set_size(chart_radar, 240, 240);
+    lv_obj_center(chart_radar);
+    lv_obj_set_style_bg_color(chart_radar, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(chart_radar, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(chart_radar, 0, LV_PART_MAIN);
+    lv_chart_set_div_line_count(chart_radar, 7, 5); 
+    lv_obj_set_style_line_color(chart_radar, lv_color_hex(HEX_NORD_BG_LIGHT), LV_PART_MAIN); 
+    lv_obj_set_style_line_width(chart_radar, 3, LV_PART_ITEMS);
+    lv_obj_set_style_size(chart_radar, 0, LV_PART_INDICATOR); 
+    lv_chart_set_type(chart_radar, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(chart_radar, 60);
+    lv_chart_set_range(chart_radar, LV_CHART_AXIS_PRIMARY_Y, -150, 150);
+
+    ser_rx = lv_chart_add_series(chart_radar, lv_color_hex(HEX_NORD_CPU), LV_CHART_AXIS_PRIMARY_Y);
+    ser_tx = lv_chart_add_series(chart_radar, lv_color_hex(HEX_NORD_ORANGE), LV_CHART_AXIS_PRIMARY_Y); 
+
+    lv_obj_t * info_panel = lv_obj_create(scr_net_radar);
+    lv_obj_set_size(info_panel, 140, 70);
+    lv_obj_center(info_panel);
+    lv_obj_set_style_bg_opa(info_panel, 0, LV_PART_MAIN); 
+    lv_obj_set_style_border_width(info_panel, 0, LV_PART_MAIN);
+    lv_obj_set_layout(info_panel, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(info_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(info_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    label_rx_speed = lv_label_create(info_panel);
+    lv_obj_set_style_text_color(label_rx_speed, lv_color_hex(HEX_NORD_CPU), 0);
+    lv_label_set_text(label_rx_speed, "DL: 0.0 Mbps");
+
+    label_tx_speed = lv_label_create(info_panel);
+    lv_obj_set_style_text_color(label_tx_speed, lv_color_hex(HEX_NORD_ORANGE), 0);
+    lv_label_set_text(label_tx_speed, "UL: 0.0 Mbps");
+}
+
+void build_cores_screen() {
+    scr_cores = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_cores, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(scr_cores, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_cores, LV_OBJ_FLAG_SCROLLABLE);
+
+    for(int i = 0; i < 32; i++) {
+        core_boxes[i] = lv_obj_create(scr_cores);
+        lv_obj_remove_style_all(core_boxes[i]);
+        lv_obj_set_style_radius(core_boxes[i], 6, 0); 
+        lv_obj_set_style_bg_opa(core_boxes[i], 255, 0);
+        lv_obj_set_style_bg_color(core_boxes[i], lv_color_hex(HEX_NORD_GPU), 0);
+        
+        core_labels[i] = lv_label_create(core_boxes[i]);
+        lv_obj_set_style_text_color(core_labels[i], lv_color_hex(HEX_NORD_BG), 0); 
+        lv_label_set_text(core_labels[i], "0%"); 
+        lv_obj_center(core_labels[i]);
+        lv_obj_add_flag(core_boxes[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void build_general_screen() {
+    scr_general = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_general, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(scr_general, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(scr_general, LV_OBJ_FLAG_SCROLLABLE);
+
+    bar_cpu = create_labeled_bar(scr_general, 15, 15, 60, 110, HEX_NORD_CPU, 0, 100, &label_bar_cpu);
+    bar_ram = create_labeled_bar(scr_general, 90, 15, 60, 110, HEX_NORD_RAM, 0, 100, &label_bar_ram);
+    bar_gpu_gen = create_labeled_bar(scr_general, 165, 15, 60, 110, HEX_NORD_GPU, 0, 100, &label_bar_gpu);
+    bar_net_dl = create_labeled_bar(scr_general, 15, 140, 210, 35, HEX_NORD_CPU, 0, 100, &label_bar_dl);
+    bar_net_ul = create_labeled_bar(scr_general, 15, 190, 210, 35, HEX_NORD_ORANGE, 0, 100, &label_bar_ul);
+}
+
+void build_big_num_screen() {
+    scr_big_num = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_big_num, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(scr_big_num, 0, LV_PART_MAIN);
+
+    cont_big_num = lv_obj_create(scr_big_num);
+    lv_obj_set_size(cont_big_num, 240, 240);
+    lv_obj_center(cont_big_num);
+    lv_obj_set_style_bg_color(cont_big_num, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_radius(cont_big_num, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(cont_big_num, 12, LV_PART_MAIN); 
+
+    label_big_num_title = lv_label_create(cont_big_num);
+    lv_obj_set_style_text_color(label_big_num_title, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_align(label_big_num_title, LV_ALIGN_TOP_MID, 0, 10);
+
+    label_big_num_val = lv_label_create(cont_big_num);
+    lv_obj_set_style_text_color(label_big_num_val, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_set_style_text_align(label_big_num_val, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_big_num_val, LV_ALIGN_CENTER, 0, 0);
+}
+
+void build_speedometer_screen() {
+    scr_speedometer = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_speedometer, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+
+    label_speedo_title = lv_label_create(scr_speedometer);
+    lv_obj_set_style_text_color(label_speedo_title, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_align(label_speedo_title, LV_ALIGN_TOP_MID, 0, 5);
+
+    meter_metric = lv_meter_create(scr_speedometer);
+    lv_obj_set_size(meter_metric, 210, 210);
+    lv_obj_align(meter_metric, LV_ALIGN_CENTER, 0, 15);
+    lv_obj_set_style_bg_color(meter_metric, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(meter_metric, 0, LV_PART_MAIN);
+
+    meter_scale = lv_meter_add_scale(meter_metric);
+    lv_meter_set_scale_ticks(meter_metric, meter_scale, 41, 2, 10, lv_color_hex(HEX_NORD_BG_LIGHT));
+    lv_meter_set_scale_major_ticks(meter_metric, meter_scale, 10, 4, 15, lv_color_hex(HEX_NORD_TEXT), 10);
+    lv_meter_set_scale_range(meter_metric, meter_scale, 0, 100, 270, 135);
+
+    indic_arc_1 = lv_meter_add_arc(meter_metric, meter_scale, 8, lv_color_hex(HEX_NORD_RED), 0);
+    indic_arc_2 = lv_meter_add_arc(meter_metric, meter_scale, 8, lv_color_hex(HEX_NORD_ORANGE), -10);
+    indic_needle_2 = lv_meter_add_needle_line(meter_metric, meter_scale, 4, lv_color_hex(HEX_NORD_ORANGE), -10);
+    indic_needle_1 = lv_meter_add_needle_line(meter_metric, meter_scale, 4, lv_color_hex(HEX_NORD_RED), 0);
+
+    label_speedo_val = lv_label_create(scr_speedometer);
+    lv_obj_set_style_text_color(label_speedo_val, lv_color_hex(HEX_NORD_TEXT), 0);
+    lv_obj_set_style_text_align(label_speedo_val, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(label_speedo_val, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+void build_summary_screen() {
+    scr_summary = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_summary, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(scr_summary, 0, LV_PART_MAIN);
+
+    cont_summary = lv_obj_create(scr_summary);
+    lv_obj_set_size(cont_summary, 240, 240);
+    lv_obj_center(cont_summary);
+    lv_obj_set_style_bg_color(cont_summary, lv_color_hex(HEX_NORD_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_width(cont_summary, 0, 0);
+    lv_obj_set_style_pad_all(cont_summary, 4, 0);
+    lv_obj_set_layout(cont_summary, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cont_summary, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_row(cont_summary, 4, 0);
+    lv_obj_set_style_pad_column(cont_summary, 4, 0);
+
+    create_summary_box(cont_summary, 114, 65, HEX_NORD_CPU, "CPU", &label_sum_cpu, true);
+    create_summary_box(cont_summary, 114, 65, HEX_NORD_RAM, "RAM", &label_sum_ram, true);
+    create_summary_box(cont_summary, 232, 50, 0xB48EAD, "NETWORK", &label_sum_net, false);
+
+    for(int i = 0; i < 4; i++) {
+        char title[10]; sprintf(title, "GPU %d", i);
+        box_sum_gpu[i] = create_summary_box(cont_summary, 50, 48, HEX_NORD_GPU, title, &label_sum_gpu[i], false);
+        lv_obj_add_flag(box_sum_gpu[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    for(int i = 0; i < 4; i++) {
+        char title[10]; sprintf(title, "DISK %d", i);
+        box_sum_disk[i] = create_summary_box(cont_summary, 50, 48, HEX_NORD_ORANGE, title, &label_sum_disk[i], false);
+        lv_obj_add_flag(box_sum_disk[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Налаштування сітки ядер
+void configure_cores_grid(uint8_t num_cores) {
+    if (num_cores == 0 || num_cores > 32 || configured_cores == num_cores) return;
+    
+    int cols, rows;
+    if (num_cores <= 2) { cols = num_cores; rows = 1; }
+    else if (num_cores <= 4) { cols = 2; rows = 2; }
+    else if (num_cores <= 6) { cols = 3; rows = 2; }
+    else if (num_cores <= 8) { cols = 4; rows = 2; }
+    else if (num_cores <= 12) { cols = 4; rows = 3; }
+    else if (num_cores <= 16) { cols = 4; rows = 4; }
+    else if (num_cores <= 24) { cols = 6; rows = 4; }
+    else { cols = 8; rows = 4; }
+    
+    int gap = 4; 
+    int box_w = (240 - gap * (cols + 1)) / cols;
+    int box_h = (240 - gap * (rows + 1)) / rows;
+    const lv_font_t * font = (box_h >= 60) ? &lv_font_montserrat_24 : &lv_font_montserrat_14; 
+    
+    for (int i = 0; i < 32; i++) {
+        if (i < num_cores) {
+            int x = gap + (i % cols) * (box_w + gap);
+            int y = gap + (i / cols) * (box_h + gap);
+            lv_obj_set_size(core_boxes[i], box_w, box_h);
+            lv_obj_align(core_boxes[i], LV_ALIGN_TOP_LEFT, x, y); 
+            lv_obj_set_style_text_font(core_labels[i], font, 0);
+            lv_obj_clear_flag(core_boxes[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(core_boxes[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    configured_cores = num_cores;
+}
+
+// Налаштування макету дашборда
+void configure_summary_layout(uint8_t num_gpus, uint8_t num_disks) {
+    if (sum_configured_gpus == num_gpus && sum_configured_disks == num_disks) return;
+    int total_w = 232;
+    int gap = 4;
+
+    if (num_gpus > 0) {
+        int gpu_w = (total_w - gap * (num_gpus - 1)) / num_gpus;
+        for(int i = 0; i < 4; i++) {
+            if (i < num_gpus) {
+                lv_obj_set_width(box_sum_gpu[i], gpu_w);
+                lv_obj_clear_flag(box_sum_gpu[i], LV_OBJ_FLAG_HIDDEN);
+            } else lv_obj_add_flag(box_sum_gpu[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (num_disks > 0) {
+        int disk_w = (total_w - gap * (num_disks - 1)) / num_disks;
+        for(int i = 0; i < 4; i++) {
+            if (i < num_disks) {
+                lv_obj_set_width(box_sum_disk[i], disk_w);
+                lv_obj_clear_flag(box_sum_disk[i], LV_OBJ_FLAG_HIDDEN);
+            } else lv_obj_add_flag(box_sum_disk[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    sum_configured_gpus = num_gpus;
+    sum_configured_disks = num_disks;
+}
+
+// Підготовка графіку для метрики
+void configure_chart_for_metric(uint8_t mode) {
+    lv_chart_set_all_value(chart_metric, ser_metric_1, LV_CHART_POINT_NONE); 
+    lv_chart_set_all_value(chart_metric, ser_metric_2, LV_CHART_POINT_NONE); 
+    lv_chart_set_series_color(chart_metric, ser_metric_2, lv_color_hex(HEX_NORD_BG));
+    if (label_chart_bottom) lv_label_set_text(label_chart_bottom, "");
+
+    if (mode == 10) { 
+        lv_label_set_text(label_chart_title, "CPU Usage (%)");
+        lv_chart_set_series_color(chart_metric, ser_metric_1, lv_color_hex(HEX_NORD_CPU));
+        currentChartMaxY = 100;
+    } else if (mode == 20) { 
+        lv_label_set_text(label_chart_title, "RAM Usage (%)");
+        lv_chart_set_series_color(chart_metric, ser_metric_1, lv_color_hex(HEX_NORD_RAM));
+        currentChartMaxY = 100;
+    } else if (mode == 30) { 
+        lv_label_set_text(label_chart_title, "Network (RX/TX) MB/s");
+        lv_chart_set_series_color(chart_metric, ser_metric_1, lv_color_hex(HEX_NORD_CPU)); 
+        lv_chart_set_series_color(chart_metric, ser_metric_2, lv_color_hex(HEX_NORD_GPU)); 
+        currentChartMaxY = 150; 
+    } else if (mode >= 40 && mode <= 49) { 
+        lv_label_set_text_fmt(label_chart_title, "GPU %d Load (%%)", mode - 40);
+        lv_chart_set_series_color(chart_metric, ser_metric_1, lv_color_hex(HEX_NORD_GPU));
+        currentChartMaxY = 100;
+    } else if (mode >= 50 && mode <= 59) { 
+        lv_label_set_text_fmt(label_chart_title, "GPU %d VRAM (%%)", mode - 50);
+        lv_chart_set_series_color(chart_metric, ser_metric_1, lv_color_hex(HEX_NORD_RAM));
+        currentChartMaxY = 100;
+    } else if (mode >= 60 && mode <= 69) { 
+        lv_label_set_text_fmt(label_chart_title, "Disk %d (R/W) MB/s", mode - 60);
+        lv_chart_set_series_color(chart_metric, ser_metric_1, lv_color_hex(HEX_NORD_CPU)); 
+        lv_chart_set_series_color(chart_metric, ser_metric_2, lv_color_hex(HEX_NORD_RED)); 
+        currentChartMaxY = 500; 
+    }
+    lv_chart_set_range(chart_metric, LV_CHART_AXIS_PRIMARY_Y, 0, currentChartMaxY);
+}
+
+void configure_big_num_for_metric(uint8_t mode) {
+    set_metric_title(label_big_num_title, mode - 60, "Network");
+}
+
+void configure_speedometer_for_metric(uint8_t mode) {
+    lv_meter_set_indicator_value(meter_metric, indic_needle_1, 0);
+    lv_meter_set_indicator_value(meter_metric, indic_needle_2, 0);
+    lv_meter_set_indicator_end_value(meter_metric, indic_arc_1, 0);
+    lv_meter_set_indicator_end_value(meter_metric, indic_arc_2, 0);
+    current_meter_max = 100;
+    lv_meter_set_scale_range(meter_metric, meter_scale, 0, current_meter_max, 270, 135);
+    set_metric_title(label_speedo_title, mode - 120, "Network (DL/UL)");
+}
+
+// =====================================================================
+// ОНОВЛЕННЯ ГРАФІЧНОГО ІНТЕРФЕЙСУ
+// =====================================================================
+void update_lvgl_widgets() {
+    // 1. Індикатори-кільця
+    lv_arc_set_value(arc_cpu, (int)animCpu.current_val);
+    if (arc_gpu[0]) lv_arc_set_value(arc_gpu[0], (int)animGpus[0].current_val);
+    lv_arc_set_value(arc_ram, (int)animRam.current_val);
+    
+    static int lastIntCpu = -1;
+    if ((int)animCpu.current_val != lastIntCpu) {
+        lastIntCpu = (int)animCpu.current_val;
+        lv_label_set_text_fmt(label_cpu_percent, "%d%%", lastIntCpu);
+    }
+    
+    // 2. Сітка ядер процесора
+    for(int i = 0; i < configured_cores; i++) {
+        int val = (int)animCores[i].current_val;
+        lv_label_set_text_fmt(core_labels[i], "%d%%", val);
+        lv_obj_set_style_bg_color(core_boxes[i], get_core_color(val), 0);
+    }
+
+    // 3. Загальний огляд (Режим 3)
+    if (activeDisplayMode == 3 && scr_general) {
+        lv_bar_set_value(bar_cpu, (int)animCpu.current_val, LV_ANIM_OFF);
+        lv_bar_set_value(bar_ram, (int)animRam.current_val, LV_ANIM_OFF);
+        lv_bar_set_value(bar_gpu_gen, (int)animGpus[0].current_val, LV_ANIM_OFF);
+
+        lv_label_set_text_fmt(label_bar_cpu, "CPU\n%d%%", (int)animCpu.current_val);
+        lv_label_set_text_fmt(label_bar_ram, "RAM\n%d%%", (int)animRam.current_val);
+        lv_label_set_text_fmt(label_bar_gpu, "GPU\n%d%%", (int)animGpus[0].current_val);
+
+        float rx_mbps = (currentMetrics.net_rx_kbps * 8.0f) / 1024.0f;
+        float tx_mbps = (currentMetrics.net_tx_kbps * 8.0f) / 1024.0f;
+        lv_bar_set_value(bar_net_dl, min(100, (int)rx_mbps), LV_ANIM_OFF);
+        lv_bar_set_value(bar_net_ul, min(100, (int)tx_mbps), LV_ANIM_OFF);
+        lv_label_set_text_fmt(label_bar_dl, "DL: %d.%d Mbps", SPLIT_F(rx_mbps));
+        lv_label_set_text_fmt(label_bar_ul, "UL: %d.%d Mbps", SPLIT_F(tx_mbps));
+    }
+
+    // 4. Велика цифра (Режими 70-129)
+    if (activeDisplayMode >= 70 && activeDisplayMode <= 129 && scr_big_num) {
+        uint8_t base = activeDisplayMode - 60;
+        float v1, v2; bool isDual;
+        get_metric_values(base, true, v1, v2, isDual);
+
+        if (isDual) {
+            lv_obj_set_style_text_font(label_big_num_val, &lv_font_montserrat_24, 0);
+            if (base == 30) lv_label_set_text_fmt(label_big_num_val, "DL: %d.%d Mbps\nUL: %d.%d Mbps", SPLIT_F(v1), SPLIT_F(v2));
+            else lv_label_set_text_fmt(label_big_num_val, "R: %d.%d MB/s\nW: %d.%d MB/s", SPLIT_F(v1), SPLIT_F(v2));
+            lv_obj_set_style_border_color(cont_big_num, get_core_color((max(v1, v2) * 100) / 500), LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_text_font(label_big_num_val, &lv_font_montserrat_48, 0);
+            lv_label_set_text_fmt(label_big_num_val, "%d%%", (int)v1);
+            lv_obj_set_style_border_color(cont_big_num, get_core_color((int)v1), LV_PART_MAIN);
+        }
+    }
+
+    // 5. Спідометр (Режими 130-189)
+    if (activeDisplayMode >= 130 && activeDisplayMode <= 189 && meter_metric) {
+        uint8_t base = activeDisplayMode - 120;
+        float v1, v2; bool isDual;
+        get_metric_values(base, true, v1, v2, isDual);
+
+        if (base == 20) v1 = (v1 * currentMetrics.total_ram_gb) / 100.0f; // Відображення використаної пам'яті (RAM).
+
+        if (base == 30) lv_label_set_text_fmt(label_speedo_val, "DL: %d.%d Mbps\nUL: %d.%d Mbps", SPLIT_F(v1), SPLIT_F(v2));
+        else if (base >= 60 && base <= 69) lv_label_set_text_fmt(label_speedo_val, "R: %d.%d MB/s\nW: %d.%d MB/s", SPLIT_F(v1), SPLIT_F(v2));
+        else if (base == 20) lv_label_set_text_fmt(label_speedo_val, "Used: %d.%d GB", SPLIT_F(v1));
+        else lv_label_set_text_fmt(label_speedo_val, "%d%%", (int)v1);
+
+        static uint8_t last_base = 255;
+        if (base != last_base) { last_base = base; current_meter_max = 100; }
+
+        if (isDual) current_meter_max = max(current_meter_max, ((int)max(v1, v2) / 50 + 1) * 50);
+        else if (base == 20) current_meter_max = currentMetrics.total_ram_gb ? currentMetrics.total_ram_gb : 16;
+        else current_meter_max = 100;
+
+        lv_meter_set_scale_range(meter_metric, meter_scale, 0, current_meter_max, 270, 135);
+        int r_v1 = min((int)v1, current_meter_max);
+        int r_v2 = min((int)v2, current_meter_max);
+        
+        lv_meter_set_indicator_value(meter_metric, indic_needle_1, r_v1);
+        lv_meter_set_indicator_end_value(meter_metric, indic_arc_1, r_v1);
+        lv_meter_set_indicator_value(meter_metric, indic_needle_2, isDual ? r_v2 : r_v1);
+        lv_meter_set_indicator_end_value(meter_metric, indic_arc_2, isDual ? r_v2 : 0);
+    }
+
+    // 6. Дашборд (Режим 5)
+    if (activeDisplayMode == 5 && scr_summary) {
+        lv_label_set_text_fmt(label_sum_cpu, "%d%%", (int)animCpu.current_val);
+        lv_label_set_text_fmt(label_sum_ram, "%d%%", (int)animRam.current_val);
+        float rx = (animNetRx.current_val * 8.0f) / 1024.0f;
+        float tx = (animNetTx.current_val * 8.0f) / 1024.0f;
+        lv_label_set_text_fmt(label_sum_net, "DL: %d.%d  |  UL: %d.%d", SPLIT_F(rx), SPLIT_F(tx));
+        
+        for(int i = 0; i < sum_configured_gpus; i++) {
+            if (sum_configured_gpus > 2) lv_label_set_text_fmt(label_sum_gpu[i], "%d%%\nV%d%%", (int)animGpus[i].current_val, currentMetrics.gpu_vram_percents[i]);
+            else lv_label_set_text_fmt(label_sum_gpu[i], "L: %d%%\nV: %d%%", (int)animGpus[i].current_val, currentMetrics.gpu_vram_percents[i]);
+        }
+        for(int i = 0; i < sum_configured_disks; i++) {
+            float r = animDisksRead[i].current_val / 1024.0f;
+            float w = animDisksWrite[i].current_val / 1024.0f;
+            if (sum_configured_disks > 2) lv_label_set_text_fmt(label_sum_disk[i], "%d.%d\n%d.%d", SPLIT_F(r), SPLIT_F(w));
+            else lv_label_set_text_fmt(label_sum_disk[i], "R: %d.%d\nW: %d.%d", SPLIT_F(r), SPLIT_F(w));
+        }
+    }
+
+    // 7. Графіки (Режими 10-69)
+    if (activeDisplayMode >= 10 && activeDisplayMode <= 69 && label_chart_title) {
+        float v1, v2; bool isDual;
+        get_metric_values(activeDisplayMode, true, v1, v2, isDual);
+        
+        if (activeDisplayMode == 20) {
+            lv_label_set_text_fmt(label_chart_title, "RAM Total: %d GB", currentMetrics.total_ram_gb);
+            lv_label_set_text_fmt(label_chart_bottom, "Used: %d.%d GB", SPLIT_F((v1 * currentMetrics.total_ram_gb) / 100.0f));
+        } else if (activeDisplayMode == 30) {
+            lv_label_set_text_fmt(label_chart_bottom, "DL: %d.%d Mbps   UL: %d.%d Mbps", SPLIT_F(v1), SPLIT_F(v2));
+        } else if (isDual) {
+            lv_label_set_text_fmt(label_chart_bottom, "R: %d.%d MB/s   W: %d.%d MB/s", SPLIT_F(v1), SPLIT_F(v2));
+        } else {
+            lv_label_set_text_fmt(label_chart_bottom, "Current: %d%%", (int)v1);
+        }
+    }
+}
+
+// =====================================================================
+// КОМУНІКАЦІЯ ТА ОБРОБКА ПАКЕТІВ (ЯДРО 0)
+// =====================================================================
+void processPacket(uint8_t* buffer, uint16_t totalLength) {
+    PacketHeader* header = (PacketHeader*)buffer;
+    switch (header->command) {
+        case HANDSHAKE:
+            Serial.write(0xBB);
+            xSemaphoreTake(dataMutex, portMAX_DELAY); 
+            if (!isConnected) isConnected = true;
+            xSemaphoreGive(dataMutex); 
+            break;
+            
+        case METRICS_BASIC:
+            if (header->payload_length == sizeof(BasicMetricsPayload)) {
+                xSemaphoreTake(dataMutex, portMAX_DELAY);
+                memcpy(&currentMetrics, buffer + sizeof(PacketHeader), sizeof(BasicMetricsPayload));
+                newDataFlag = true; 
+                xSemaphoreGive(dataMutex);
+            }
+            break;
+            
+        case SET_DISPLAY_MODE:
+            if (header->payload_length == 1) {
+                xSemaphoreTake(dataMutex, portMAX_DELAY);
+                currentDisplayMode = buffer[sizeof(PacketHeader)];
+                xSemaphoreGive(dataMutex);
+            }
+            break;
+    }
+}
+
+void UartTaskCode(void *pvParameters) {
+    unsigned long lastRxByteTime = 0;
+    const unsigned long RX_TIMEOUT_MS = 50;
+    
+    for(;;) {
+        if (rxState != WAIT_MAGIC && (millis() - lastRxByteTime > RX_TIMEOUT_MS)) {
+            rxState = WAIT_MAGIC;
+            rxIndex = 0;
+        }
+
+        while (Serial.available() > 0) {
+            uint8_t b = Serial.read();
+            lastRxByteTime = millis(); 
+            
+            if (rxState == WAIT_MAGIC) {
+                if (b == 0xAA) { rxBuffer[0] = b; rxIndex = 1; rxState = WAIT_HEADER; }
+            } 
+            else if (rxState == WAIT_HEADER) {
+                if (rxIndex >= sizeof(rxBuffer)) { rxState = WAIT_MAGIC; rxIndex = 0; continue; }
+                rxBuffer[rxIndex++] = b;
+                if (rxIndex == sizeof(PacketHeader)) {
+                    memcpy(&tempHeader, rxBuffer, sizeof(PacketHeader));
+                    rxState = (tempHeader.payload_length > 128) ? WAIT_MAGIC : WAIT_PAYLOAD;
+                    if (rxState == WAIT_MAGIC) rxIndex = 0;
+                }
+            } 
+            else if (rxState == WAIT_PAYLOAD) {
+                if (rxIndex >= sizeof(rxBuffer)) { rxState = WAIT_MAGIC; rxIndex = 0; continue; }
+                rxBuffer[rxIndex++] = b;
+                uint16_t expectedLength = sizeof(PacketHeader) + tempHeader.payload_length + 1; 
+                
+                if (rxIndex == expectedLength) {
+                    uint8_t receivedChecksum = rxBuffer[rxIndex - 1];
+                    uint8_t calculatedChecksum = CalculateChecksum(rxBuffer, rxIndex - 1);
+                    if (receivedChecksum == calculatedChecksum) {
+                        xSemaphoreTake(dataMutex, portMAX_DELAY);
+                        lastDataReceived = millis();
+                        xSemaphoreGive(dataMutex);
+                        processPacket(rxBuffer, rxIndex);
+                    }
+                    rxState = WAIT_MAGIC;
+                    rxIndex = 0;
+                }
+            }
+        }
+
+        xSemaphoreTake(dataMutex, portMAX_DELAY);
+        bool connectedTemp = isConnected;
+        unsigned long lastRecvTemp = lastDataReceived;
+        xSemaphoreGive(dataMutex);
+        
+        if (connectedTemp && lastRecvTemp > 0 && (millis() - lastRecvTemp > 3000)) {
+            xSemaphoreTake(dataMutex, portMAX_DELAY);
+            isConnected = false;
+            lastDataReceived = 0;
+            xSemaphoreGive(dataMutex);
+        }
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+// =====================================================================
+// ОСНОВНИЙ ЦИКЛ ПРОГРАМИ (ЯДРО 1)
+// =====================================================================
+void setup() {
+    Serial.begin(115200);
+    
+    // Ініціалізація дисплея
+    tft.init(240, 240); 
+    tft.setRotation(0);
+    tft.invertDisplay(true); 
+    tft.fillScreen(NORD_BG);
+
+    // Ініціалізація LVGL
+    lv_init();
+    lv_disp_draw_buf_init(&draw_buf, buf1, NULL, SCREEN_WIDTH * SCREEN_HEIGHT / 10);
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = SCREEN_WIDTH;
+    disp_drv.ver_res = SCREEN_HEIGHT;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+    lv_disp_drv_register(&disp_drv);
+
+    // Побудова екранів
+    build_splash_screen();
+    build_metric_screen();
+    build_chart_screen();
+    build_cores_screen();
+    build_net_radar_screen();
+    build_general_screen();
+    build_big_num_screen();     
+    build_speedometer_screen(); 
+    build_summary_screen();
+    
+    lv_scr_load(scr_splash);
+
+    dataMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(UartTaskCode, "UART_Task", 10000, NULL, 1, NULL, 0);
+}
+
+void loop() {
+    // 1. Оновлення таймерів LVGL
+    static uint32_t last_tick = millis();
+    uint32_t current_tick = millis();
+    lv_tick_inc(current_tick - last_tick);
+    last_tick = current_tick;
+    lv_timer_handler();
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    bool localConnected = isConnected;
+    BasicMetricsPayload renderMetrics = currentMetrics;
+    uint8_t localMode = currentDisplayMode;
+    bool localNewData = newDataFlag;
+    
+    // 2. Ініціалізація анімації при надходженні нових даних
+    if (newDataFlag) {
+        animCpu.old_val = animCpu.current_val; animCpu.target_val = renderMetrics.cpu_total;
+        animRam.old_val = animRam.current_val; animRam.target_val = renderMetrics.ram_percent;
+        animNetRx.old_val = animNetRx.current_val; animNetRx.target_val = renderMetrics.net_rx_kbps;
+        animNetTx.old_val = animNetTx.current_val; animNetTx.target_val = renderMetrics.net_tx_kbps;
+
+        for(int i = 0; i < renderMetrics.num_gpus && i < 4; i++) {
+            animGpus[i].old_val = animGpus[i].current_val;
+            animGpus[i].target_val = renderMetrics.gpu_loads[i];
+        }
+        for(int i = 0; i < renderMetrics.num_disks && i < 4; i++) {
+            animDisksRead[i].old_val = animDisksRead[i].current_val;
+            animDisksRead[i].target_val = renderMetrics.disk_read_kbps[i];
+            animDisksWrite[i].old_val = animDisksWrite[i].current_val;
+            animDisksWrite[i].target_val = renderMetrics.disk_write_kbps[i];
+        }
+        for(int c = 0; c < renderMetrics.num_cores && c < 32; c++) {
+            animCores[c].old_val = animCores[c].current_val;
+            animCores[c].target_val = renderMetrics.core_loads[c];
+        }
+
+        animStartTime = millis();
+        newDataFlag = false;
+    }
+    xSemaphoreGive(dataMutex);
+    
+    // 3. Логіка відображення
+    if (localConnected) {
+        // Керування режимами
+        if (!metricUIShown || activeDisplayMode != localMode) {
+            if (localMode == 0) { lv_scr_load(scr_metrics); } 
+            else if (localMode == 1) { lv_scr_load(scr_net_radar); } 
+            else if (localMode == 2) { configure_cores_grid(renderMetrics.num_cores); lv_scr_load(scr_cores); } 
+            else if (localMode == 3) { lv_scr_load(scr_general); }
+            else if (localMode == 5) { configure_summary_layout(renderMetrics.num_gpus, renderMetrics.num_disks); lv_scr_load(scr_summary); }
+            else if (localMode >= 10 && localMode <= 69) { configure_chart_for_metric(localMode); lv_scr_load(scr_chart); }
+            else if (localMode >= 70 && localMode <= 129) { configure_big_num_for_metric(localMode); lv_scr_load(scr_big_num); }
+            else if (localMode >= 130 && localMode <= 189) { configure_speedometer_for_metric(localMode); lv_scr_load(scr_speedometer); }
+            else { lv_scr_load(scr_metrics); }
+            
+            metricUIShown = true;
+            activeDisplayMode = localMode;
+        }
+
+        // Оновлення динамічних графіків
+        if (localNewData) {
+            if (activeDisplayMode == 1) {
+                float v1, v2; bool isDual;
+                get_metric_values(30, false, v1, v2, isDual); // Використовуємо сирі дані для графіку
+                
+                int rx_val = min(32000, (int)v1);
+                int tx_val = min(32000, (int)v2);
+                lv_chart_set_next_value(chart_radar, ser_rx, rx_val);
+                lv_chart_set_next_value(chart_radar, ser_tx, -tx_val);
+
+                lv_label_set_text_fmt(label_rx_speed, "DL: %d.%d Mbps", SPLIT_F(v1));
+                lv_label_set_text_fmt(label_tx_speed, "UL: %d.%d Mbps", SPLIT_F(v2));
+
+                int maxVisibleVal = 0;
+                lv_coord_t * y_arr_rx = lv_chart_get_y_array(chart_radar, ser_rx);
+                lv_coord_t * y_arr_tx = lv_chart_get_y_array(chart_radar, ser_tx);
+                uint16_t point_cnt = lv_chart_get_point_count(chart_radar);
+                for (uint16_t i = 0; i < point_cnt; i++) {
+                    if (y_arr_rx[i] != LV_CHART_POINT_NONE && y_arr_rx[i] > maxVisibleVal) maxVisibleVal = y_arr_rx[i];
+                    if (y_arr_tx[i] != LV_CHART_POINT_NONE && -y_arr_tx[i] > maxVisibleVal) maxVisibleVal = -y_arr_tx[i];
+                }
+                int newTargetMaxY = max(150, maxVisibleVal + (maxVisibleVal / 5));
+                if (currentRadarMaxY != newTargetMaxY) {
+                    currentRadarMaxY = newTargetMaxY;
+                    lv_chart_set_range(chart_radar, LV_CHART_AXIS_PRIMARY_Y, -currentRadarMaxY, currentRadarMaxY);
+                }
+            }
+            else if (activeDisplayMode >= 10 && activeDisplayMode <= 69) {
+                float v1, v2; bool isDual;
+                get_metric_values(activeDisplayMode, false, v1, v2, isDual);
+                
+                int val1 = min(32000, (int)v1);
+                int val2 = min(32000, (int)v2);
+                lv_chart_set_next_value(chart_metric, ser_metric_1, val1);
+                if (isDual) lv_chart_set_next_value(chart_metric, ser_metric_2, val2);
+
+                if (activeDisplayMode == 30 || (activeDisplayMode >= 60 && activeDisplayMode <= 69)) {
+                    int maxVisibleVal = 0;
+                    int minCeiling = (activeDisplayMode == 30) ? 100 : 200;
+                    
+                    lv_coord_t * y_arr_1 = lv_chart_get_y_array(chart_metric, ser_metric_1);
+                    lv_coord_t * y_arr_2 = lv_chart_get_y_array(chart_metric, ser_metric_2);
+                    uint16_t point_cnt = lv_chart_get_point_count(chart_metric);
+                    for (uint16_t i = 0; i < point_cnt; i++) {
+                        if (y_arr_1[i] != LV_CHART_POINT_NONE && y_arr_1[i] > maxVisibleVal) maxVisibleVal = y_arr_1[i];
+                        if (isDual && y_arr_2[i] != LV_CHART_POINT_NONE && y_arr_2[i] > maxVisibleVal) maxVisibleVal = y_arr_2[i];
+                    }
+                    int newTargetMaxY = max(minCeiling, maxVisibleVal + (maxVisibleVal / 5));
+                    if (currentChartMaxY != newTargetMaxY) {
+                        currentChartMaxY = newTargetMaxY;
+                        lv_chart_set_range(chart_metric, LV_CHART_AXIS_PRIMARY_Y, 0, currentChartMaxY);
+                    }
+                }
+            }
+        }
+
+        // 4. Інтерполяція даних анімації
+        unsigned long elapsed = millis() - animStartTime;
+        float progress = min(1.0f, (float)elapsed / ANIM_DURATION);
+        
+        animCpu.current_val = animCpu.old_val + (animCpu.target_val - animCpu.old_val) * progress;
+        animRam.current_val = animRam.old_val + (animRam.target_val - animRam.old_val) * progress;
+        animNetRx.current_val = animNetRx.old_val + (animNetRx.target_val - animNetRx.old_val) * progress;
+        animNetTx.current_val = animNetTx.old_val + (animNetTx.target_val - animNetTx.old_val) * progress;
+        
+        for(int i = 0; i < 4; i++) {
+            animGpus[i].current_val = animGpus[i].old_val + (animGpus[i].target_val - animGpus[i].old_val) * progress;
+            animDisksRead[i].current_val = animDisksRead[i].old_val + (animDisksRead[i].target_val - animDisksRead[i].old_val) * progress;
+            animDisksWrite[i].current_val = animDisksWrite[i].old_val + (animDisksWrite[i].target_val - animDisksWrite[i].old_val) * progress;
+        }
+        for(int c = 0; c < renderMetrics.num_cores && c < 32; c++) {
+            animCores[c].current_val = animCores[c].old_val + (animCores[c].target_val - animCores[c].old_val) * progress;
+        }
+
+        // 5. Оновлення віджетів на екрані
+        update_lvgl_widgets();
+    } 
+    else {
+        // Обробка втрати з'єднання
+        if (metricUIShown) {
+            lv_scr_load(scr_splash);
+            metricUIShown = false;
+            activeDisplayMode = -1; 
+        }
+    }
+
+    delay(5);
+}

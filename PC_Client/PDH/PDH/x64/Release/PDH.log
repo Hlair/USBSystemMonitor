@@ -1,0 +1,21 @@
+﻿  main.cpp
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(288,91): warning C4267: 'argument': conversion from 'size_t' to '_Ty', possible loss of data
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(288,91): warning C4267:         with
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(288,91): warning C4267:         [
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(288,91): warning C4267:             _Ty=uint8_t
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(288,91): warning C4267:         ]
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(289,91): warning C4267: 'argument': conversion from 'size_t' to '_Ty', possible loss of data
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(289,91): warning C4267:         with
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(289,91): warning C4267:         [
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(289,91): warning C4267:             _Ty=uint8_t
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(289,91): warning C4267:         ]
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(292,96): warning C4267: 'argument': conversion from 'size_t' to '_Ty', possible loss of data
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(292,96): warning C4267:         with
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(292,96): warning C4267:         [
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(292,96): warning C4267:             _Ty=uint8_t
+C:\Users\nazar\source\repos\PDH\PDH\main.cpp(292,96): warning C4267:         ]
+  Generating code
+  Previous IPDB and IOBJ mismatch, fall back to full compilation.
+  All 2739 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  PDH.vcxproj -> C:\Users\nazar\source\repos\PDH\x64\Release\PDH.exe

@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="PDH/PDH.vcxproj" Id="ab1c9b08-96b4-478e-a20e-940b3c151f4d" />
+</Solution>
